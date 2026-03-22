@@ -12,13 +12,7 @@ app.use(cors({
     allowedHeaders: '*'
 }));
 
-app.get('/proxy', async (req, res) => {
-    const targetUrl = req.query.url;
-    
-    if (!targetUrl) {
-        return res.status(400).send('Missing ?url= parameter');
-    }
-
+function proxyRequest(targetUrl, res) {
     try {
         const url = new URL(targetUrl);
         const client = url.protocol === 'https:' ? https : http;
@@ -32,18 +26,42 @@ app.get('/proxy', async (req, res) => {
                 'Host': url.host,
             }
         }, (proxyRes) => {
-            // Forward status code
+            // Handle redirects ourselves instead of letting browser follow
+            if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode)) {
+                const location = proxyRes.headers['location'];
+                if (location) {
+                    // Convert relative redirects to absolute
+                    const redirectUrl = new URL(location, targetUrl).href;
+                    // Proxy the redirect destination instead
+                    return proxyRequest(redirectUrl, res);
+                }
+            }
+
             res.status(proxyRes.statusCode);
-            
-            // Forward headers (except ones that break iframes)
+
             Object.keys(proxyRes.headers).forEach(key => {
-                if (!['x-frame-options', 'content-security-policy', 'content-length', 'transfer-encoding'].includes(key.toLowerCase())) {
+                const skip = ['x-frame-options', 'content-security-policy', 
+                              'content-length', 'transfer-encoding', 
+                              'location', 'set-cookie'];
+                if (!skip.includes(key.toLowerCase())) {
                     res.setHeader(key, proxyRes.headers[key]);
                 }
             });
 
-            // Pipe the response
-            proxyRes.pipe(res);
+            // Rewrite HTML to proxy links
+            const contentType = proxyRes.headers['content-type'] || '';
+            if (contentType.includes('text/html')) {
+                let body = '';
+                proxyRes.on('data', chunk => body += chunk);
+                proxyRes.on('end', () => {
+                    // Inject base tag so relative links work
+                    const base = `<base href="${targetUrl}">`;
+                    body = body.replace(/<head([^>]*)>/i, `<head$1>${base}`);
+                    res.send(body);
+                });
+            } else {
+                proxyRes.pipe(res);
+            }
         });
 
         proxyReq.on('error', (err) => {
@@ -54,6 +72,14 @@ app.get('/proxy', async (req, res) => {
     } catch (err) {
         res.status(500).send('Error: ' + err.message);
     }
+}
+
+app.get('/proxy', (req, res) => {
+    const targetUrl = req.query.url;
+    if (!targetUrl) {
+        return res.status(400).send('Missing ?url= parameter');
+    }
+    proxyRequest(targetUrl, res);
 });
 
 app.get('/', (req, res) => {
